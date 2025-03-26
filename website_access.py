@@ -6,7 +6,6 @@ from PIL import Image
 import pytesseract
 from playwright.async_api import async_playwright
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 async def open_page_and_capture(link: str):
@@ -124,7 +123,7 @@ async def try_click_apply_button(page):
     pattern = re.compile(r"(apply|submit resume|start application)", re.IGNORECASE)
     candidate, score = await get_best_apply_candidate(page, pattern)
 
-    if not candidate:
+    if not candidate or score<1:
         print("❌ No candidate found for Apply button (standard logic).")
         return False
 
@@ -164,14 +163,69 @@ async def try_click_apply_button(page):
 
 
 async def is_embedded_form_present(page) -> bool:
-    print("🔍 Checking for embedded application form...")
+    print("🔍 Checking for embedded application form using scoring system...")
+
+    # Layer 1: Traditional <form> tag with enough inputs
+    form_input_count = await page.locator("form input, form textarea, form select").count()
+    if form_input_count >= 3:
+        print(f"✅ Found <form> tag with {form_input_count} fields. Passing immediately.")
+        return True
+
+    # Layer 2: Scoring non-semantic inputs
+    inputs = page.locator("input, textarea, select")
+    total_fields = await inputs.count()
+    score = 0
+
+    for i in range(total_fields):
+        el = inputs.nth(i)
+
+        try:
+            # Get useful metadata
+            placeholder = (await el.get_attribute("placeholder") or "").lower()
+            aria_label = (await el.get_attribute("aria-label") or "").lower()
+            name_attr = (await el.get_attribute("name") or "").lower()
+            field_type = (await el.get_attribute("type") or "").lower()
+            associated_text = f"{placeholder} {aria_label} {name_attr}"
+
+            # Scoring rules
+            if "email" in associated_text:
+                score += 3
+            if "phone" in associated_text:
+                score += 3
+            if "resume" in associated_text or "cv" in associated_text:
+                score += 10
+            if "upload" in associated_text or "file" in associated_text:
+                score += 5
+            if "linkedin" in associated_text or "github" in associated_text:
+                score += 3
+            if "cover" in associated_text:
+                score += 5
+            if field_type == "file":
+                score += 10
+
+        except Exception:
+            continue
+
+    # Bonus for sufficient number of fields
+    if total_fields >= 4:
+        score += 5
+
+    print(f"🧮 Application form field score: {score}")
+
+    if score >= 15:
+        print("✅ High enough score to confirm an embedded application form.")
+        return True
+
+    # Layer 3: Iframe check for known ATS platforms
     for frame in page.frames:
         frame_url = frame.url.lower()
         if any(host in frame_url for host in ["greenhouse.io", "lever.co", "workday.com"]):
-            if await frame.locator("input, textarea, select").count() > 0:
-                print(f"✅ Detected embedded application form in iframe: {frame_url}")
+            frame_inputs = await frame.locator("input, textarea, select").count()
+            if frame_inputs > 2:
+                print(f"✅ Detected embedded application form in iframe ({frame_url}) with {frame_inputs} fields.")
                 return True
-    print("❌ No embedded form detected.")
+
+    print("❌ No application form detected.")
     return False
 
 
@@ -243,69 +297,57 @@ async def lazy_scroll_and_find_apply_button(page):
 
 
 async def compute_candidate_score(candidate, page) -> int:
-    """
-    Returns a score for a candidate element based on its inner text, tag name,
-    and bounding box dimensions. Adjust weights as needed.
-    """
+    score = 0
     try:
-        text = await candidate.inner_text()  # Await here
-        text = text.strip().lower()  # Process text after awaiting
+        text = await candidate.inner_text()
+        text = text.strip().lower()
     except Exception:
         text = ""
 
-    score = 0
-    # Positive keywords
+    print(f"🧐 Scoring candidate: '{text}'")
+
     if "apply" in text:
         score += 10
     if text in ["apply", "apply now"]:
         score += 5
-    if "submit resume" in text:
-        score += 8
-    if "start application" in text:
+    if "submit resume" in text or "start application" in text:
         score += 8
 
-    # Negative keywords (false positives)
-    if "learn more" in text:
-        score -= 50
-    if "how to" in text:
+    # Negative keywords
+    if "learn more" in text or "how to" in text or "details" in text:
         score -= 30
-    if "details" in text:
-        score -= 10
-    if "job alert" in text:
-        score -= 10
-    if "save" or "Save" in text:
+    if "save" in text or "bookmark" in text:
         score -= 20
-    if "Apply and save" in text:
-        score -= 20
-    if "Apply without saving" in text:
-        score -= 20
+    if "saving" in text:
+        score -=20
 
-
-    # Tag name bonus
+    # Tag bonuses
     try:
-        tag_name = await candidate.evaluate("el => el.tagName")
-        if tag_name:
-            tag_name = tag_name.lower()
-            if tag_name == "button":
+        tag = await candidate.evaluate("el => el.tagName")
+        if tag:
+            tag = tag.lower()
+            if tag == "button":
                 score += 5
-            elif tag_name == "a":
+            elif tag == "a":
                 score += 3
-            elif tag_name == "div":
-                score += 2
+            elif tag == "div":
+                score += 1
     except Exception:
         pass
 
-    # Optionally consider size (if element is very small, it might not be the real button)
+    # Bounding box size check
     try:
         box = await candidate.bounding_box()
         if box:
             if box["width"] < 50 or box["height"] < 20:
-                score -= 5
+                print(f"⚠️ Small button detected: {box}")
+                score -= 10
             else:
                 score += 2
     except Exception:
         pass
 
+    print(f"🔢 Final score: {score}")
     return score
 
 
@@ -326,7 +368,7 @@ async def get_best_apply_candidate(page, pattern) -> (object, int):
         except Exception:
             text = ""
 
-        score = await compute_candidate_score(candidate)  # ✅ Awaiting the compute function as well
+        score = await compute_candidate_score(candidate,page)  # ✅ Awaiting the compute function as well
 
         print(f"Candidate {i}: text='{text}', score={score}")
 
