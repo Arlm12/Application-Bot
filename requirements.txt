@@ -7,3 +7,5 @@ python-dotenv
 pandas
 openpyxl
 playwright
+pytesseract
+pillow
